@@ -8,6 +8,8 @@ import re
 from datetime import datetime
 from typing import AsyncIterator, List
 
+
+print(sys.path)
 # 确保项目根目录在 sys.path 中
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
