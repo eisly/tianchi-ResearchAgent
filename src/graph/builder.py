@@ -4,6 +4,7 @@ from langgraph.graph import END, START, StateGraph
 from src.prompts.planner_model import StepType
 
 from .nodes import (
+    analyst_node,
     planner_node,
     research_team_node,
     researcher_node,
@@ -257,12 +258,19 @@ Your Output: September 13th Incident
     return {"messages": [response]}
 
 def continue_to_running_research_team(state: State):
+    # Quality gate requires replanning when the previous step fails confidence checks
+    if state.get("last_step_status") == "replan":
+        return "planner"
+
     current_plan = state.get("current_plan")
     if not current_plan or not current_plan.steps:
         return "planner"
 
     if all(step.execution_res for step in current_plan.steps):
-        return "chatbot"
+        max_steps = int(state.get("react_max_steps", 3) or 3)
+        if getattr(current_plan, "has_enough_context", False) or len(current_plan.steps) >= max_steps:
+            return "chatbot"
+        return "planner"
 
     # Find first incomplete step
     incomplete_step = None
@@ -274,6 +282,9 @@ def continue_to_running_research_team(state: State):
     if not incomplete_step:
         return "chatbot"
 
+    step_type = str(getattr(incomplete_step, "step_type", "") or "").lower()
+    if step_type in (StepType.ANALYSIS.value, StepType.PROCESSING.value):
+        return "analyst"
     return "researcher"
 
 
@@ -284,12 +295,15 @@ def _build_base_graph():
     builder.add_node("planner", planner_node)
     builder.add_node("research_team", research_team_node)
     builder.add_node("researcher", researcher_node)
+    builder.add_node("analyst", analyst_node)
     builder.add_node("chatbot", chatbot)
     builder.add_conditional_edges(
         "research_team",
         continue_to_running_research_team,
-        ["planner", "researcher", "chatbot"],
+        ["planner", "researcher", "analyst", "chatbot"],
     )
+    builder.add_edge("researcher", "research_team")
+    builder.add_edge("analyst", "research_team")
     builder.add_edge("chatbot", END)
     return builder
 

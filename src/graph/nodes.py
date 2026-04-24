@@ -18,7 +18,7 @@ from src.citations.extractor import extract_citations_from_messages, merge_citat
 from src.config.agents import AGENT_LLM_MAP
 from src.config.configuration import Configuration
 from src.llms.llm import get_llm_by_type, get_llm_token_limit_by_type
-from src.prompts.planner_model import Plan
+from src.prompts.planner_model import Plan, StepType
 from src.prompts.template import apply_prompt_template, get_system_prompt_template
 # from src.tools import get_web_search_tool
 # from src.tools.search import LoggedTavilySearch
@@ -88,6 +88,13 @@ def preserve_state_meta_fields(state: State) -> dict:
         "locale": state.get("locale", "en-US"),
         "research_topic": state.get("research_topic", ""),
         "resources": state.get("resources", []),
+        "current_step_index": state.get("current_step_index", -1),
+        "replan_count": state.get("replan_count", 0),
+        "replan_reason": state.get("replan_reason", ""),
+        "last_step_status": state.get("last_step_status", ""),
+        "step_diagnostics": state.get("step_diagnostics", []),
+        "step_count": state.get("step_count", 0),
+        "react_max_steps": state.get("react_max_steps", 3),
     }
 
 
@@ -180,6 +187,98 @@ def validate_and_fix_plan(plan: dict, enforce_web_search: bool = False, enable_w
     return plan
 
 
+def _find_next_unexecuted_step(current_plan):
+    """Return (index, step) of the next unexecuted step, or (-1, None)."""
+    if not current_plan or not getattr(current_plan, "steps", None):
+        return -1, None
+    for idx, step in enumerate(current_plan.steps):
+        if not step.execution_res:
+            return idx, step
+    return -1, None
+
+
+def _evaluate_step_quality(step, content: str, citations_count: int) -> tuple[bool, str]:
+    """
+    Lightweight quality gate.
+    Returns:
+        (should_replan, reason)
+    """
+    text = (content or "").strip()
+    lower = text.lower()
+
+    hard_fail_markers = [
+        "[error]",
+        "tool execution failed",
+        "timed out",
+        "search failed",
+        "per-tool limit reached",
+        "maximum of",
+        "could not be accessed",
+    ]
+    if any(marker in lower for marker in hard_fail_markers):
+        return True, "step_contains_hard_error_or_tool_block"
+
+    step_type = str(getattr(step, "step_type", "") or "").lower()
+    if step_type in (StepType.RESEARCH.value, StepType.ANALYSIS.value) and len(text) < 80:
+        return True, "step_result_too_short"
+
+    # Citation extraction may still miss some formats, so only use it as a soft signal.
+    if step_type == StepType.RESEARCH.value and citations_count == 0:
+        low_conf_markers = ["maybe", "not sure", "could not be definitively identified", "unable to verify"]
+        if any(marker in lower for marker in low_conf_markers):
+            return True, "research_low_confidence_without_citations"
+
+    return False, ""
+
+
+def _build_react_micro_plan(previous_plan: Plan | None, new_plan: Plan, max_steps: int) -> Plan:
+    """
+    Keep only completed historical steps + exactly one newly planned step.
+    This enforces iterative ReAct-style planning.
+    """
+    completed_steps = []
+    if previous_plan and getattr(previous_plan, "steps", None):
+        completed_steps = [step for step in previous_plan.steps if step.execution_res]
+
+    # Cap completed history to avoid overflow if old states had longer plans.
+    completed_steps = completed_steps[:max_steps]
+
+    if len(completed_steps) >= max_steps:
+        return Plan.model_validate({
+            "locale": new_plan.locale,
+            "has_enough_context": True,
+            "thought": new_plan.thought,
+            "key_clues": new_plan.key_clues,
+            "title": new_plan.title,
+            "steps": [step.model_dump() for step in completed_steps],
+        })
+
+    next_step = None
+    for step in new_plan.steps:
+        if not step.execution_res:
+            next_step = step
+            break
+
+    merged_steps = [step.model_dump() for step in completed_steps]
+    if next_step is not None:
+        merged_steps.append(next_step.model_dump())
+
+    has_enough_context = bool(new_plan.has_enough_context)
+    if next_step is not None:
+        has_enough_context = False
+    if len(merged_steps) >= max_steps and all(step.get("execution_res") for step in merged_steps if "execution_res" in step):
+        has_enough_context = True
+
+    return Plan.model_validate({
+        "locale": new_plan.locale,
+        "has_enough_context": has_enough_context,
+        "thought": new_plan.thought,
+        "key_clues": new_plan.key_clues,
+        "title": new_plan.title,
+        "steps": merged_steps[:max_steps],
+    })
+
+
 async def planner_node(
         state: State, config: RunnableConfig
 ) -> Command[Literal["research_team"]]:
@@ -206,11 +305,37 @@ async def planner_node(
     logger.debug("planner is working.....")
     configurable = Configuration.from_runnable_config(config)
     plan_iterations = state["plan_iterations"] if state.get("plan_iterations", 0) else 0
+    previous_plan = state.get("current_plan") if isinstance(state.get("current_plan"), Plan) else None
+    react_max_steps = min(int(configurable.max_step_num or 3), 3)
 
     # Normal mode: use full conversation history
     # 正常模式：加载系统提示词并使用完整的对话历史作为上下文
     logger.debug("planner is working.....")
     messages = apply_prompt_template("planner", state, configurable, state.get("locale", "en-US"))
+
+    # Replan hint: tell planner why the previous step was rejected by quality gate
+    replan_reason = state.get("replan_reason", "")
+    if replan_reason:
+        replan_hint = HumanMessage(
+            content=(
+                "REPLAN REQUIRED.\n"
+                f"Reason from quality gate: {replan_reason}\n"
+                "Please keep verified completed findings, and rewrite only the remaining steps."
+            ),
+            name="system",
+        )
+        messages.append(replan_hint)
+
+    # Force micro-plan behavior: only one next step per planning round.
+    micro_plan_hint = HumanMessage(
+        content=(
+            "MICRO-PLANNING MODE.\n"
+            "You must output at most ONE actionable next step in `steps` for this round.\n"
+            "Do not produce a full multi-step plan. Next round will re-plan again after execution."
+        ),
+        name="system",
+    )
+    messages.append(micro_plan_hint)
 
     if configurable.enable_deep_thinking:
         llm = get_llm_by_type("reasoning")
@@ -226,15 +351,18 @@ async def planner_node(
     except Exception as e:
         logger.warning(f"[planner] Could not determine LLM model name: {e}")
 
-    # if the plan iterations is greater than the max plan iterations, return the reporter node
-    # 检查计划迭代次数是否超过最大限制，如果超过则直接结束，防止死循环
-    # 强制限制最大迭代次数为3次，防止无限循环
-    max_iterations = min(configurable.max_plan_iterations, 3)
+    # ReAct micro-plan mode:
+    # - one planning round per executed step
+    # - maximum 3 planning rounds
+    max_iterations = min(max(int(configurable.max_plan_iterations or 1), react_max_steps), react_max_steps)
     if plan_iterations >= max_iterations:
         logger.warning(f"Planner reached max iterations ({max_iterations}). Forcing termination.")
         logger.info("[planner]: Finished execution")
         return Command(
-            update=preserve_state_meta_fields(state),
+            update={
+                **preserve_state_meta_fields(state),
+                "react_max_steps": react_max_steps,
+            },
             goto="chatbot"
         )
     full_response = ""
@@ -324,13 +452,20 @@ async def planner_node(
         logger.info("Planner response has enough context.")
         logger.info("[planner]: Finished execution")
         new_plan = Plan.model_validate(curr_plan)
+        new_plan = _build_react_micro_plan(previous_plan, new_plan, react_max_steps)
+        planner_message_content = json.dumps(new_plan.model_dump(), ensure_ascii=False)
         # 如果上下文足够，直接跳转到 chatbot 生成最终回答
         return Command(
             update={
                 **preserve_state_meta_fields(state),
-                "messages": [AIMessage(content=full_response, name="planner")],
+                "messages": [AIMessage(content=planner_message_content, name="planner")],
                 "current_plan": new_plan,
                 "locale": new_plan.locale,
+                "last_step_status": "",
+                "replan_reason": "",
+                "current_step_index": -1,
+                "step_count": len([s for s in new_plan.steps if s.execution_res]),
+                "react_max_steps": react_max_steps,
             },
             goto="chatbot",
         )
@@ -350,12 +485,19 @@ async def planner_node(
                 # Force has_enough_context to true
                 curr_plan["has_enough_context"] = True
                 new_plan = Plan.model_validate(curr_plan)
+                new_plan = _build_react_micro_plan(previous_plan, new_plan, react_max_steps)
+                planner_message_content = json.dumps(new_plan.model_dump(), ensure_ascii=False)
                 return Command(
                     update={
                         **preserve_state_meta_fields(state),
-                        "messages": [AIMessage(content=full_response, name="planner")],
+                        "messages": [AIMessage(content=planner_message_content, name="planner")],
                         "current_plan": new_plan,
                         "locale": new_plan.locale,
+                        "last_step_status": "",
+                        "replan_reason": "",
+                        "current_step_index": -1,
+                        "step_count": len([s for s in new_plan.steps if s.execution_res]),
+                        "react_max_steps": react_max_steps,
                     },
                     goto="chatbot",
                 )
@@ -365,7 +507,9 @@ async def planner_node(
     # Check if we have valid steps
     # 检查计划中是否包含有效的研究步骤
     if isinstance(curr_plan, dict) and curr_plan.get("steps"):
-        new_plan = Plan.model_validate(curr_plan)
+        generated_plan = Plan.model_validate(curr_plan)
+        new_plan = _build_react_micro_plan(previous_plan, generated_plan, react_max_steps)
+        planner_message_content = json.dumps(new_plan.model_dump(), ensure_ascii=False)
 
         # Increment plan iterations
         # 增加计划迭代计数器
@@ -376,10 +520,15 @@ async def planner_node(
         return Command(
             update={
                 **preserve_state_meta_fields(state),
-                "messages": [AIMessage(content=full_response, name="planner")],
+                "messages": [AIMessage(content=planner_message_content, name="planner")],
                 "current_plan": new_plan,
                 "locale": new_plan.locale,
                 "plan_iterations": plan_iterations,
+                "last_step_status": "",
+                "replan_reason": "",
+                "current_step_index": -1,
+                "step_count": len([s for s in new_plan.steps if s.execution_res]),
+                "react_max_steps": react_max_steps,
             },
             goto="research_team",
         )
@@ -680,14 +829,14 @@ async def _handle_recursion_limit_fallback(
 
 async def _execute_agent_step(
         state: State, agent, agent_name: str, config: RunnableConfig = None, system_messages: list = None
-) -> Command[Literal["research_team"]]:
+) -> Command[Literal["research_team", "planner"]]:
     """
     Helper function to execute a step using the specified agent.
     
     实现步骤:
-    1. **重置搜索计数器**: 
+    1. **重置搜索计数器**:
        - 确保每个 Agent 步骤开始时，搜索工具的使用次数计数器归零。
-       - 限制每个步骤最多使用 5 次搜索工具。
+       - 限制每个步骤最多使用 20 次搜索工具（并限制单工具重复调用）。
     
     2. **确定当前任务**:
        - 从 `current_plan` 中查找第一个未执行的步骤 (`execution_res` 为空)。
@@ -736,19 +885,24 @@ async def _execute_agent_step(
     # 查找第一个尚未执行的步骤 (execution_res 为空)
     # 同时收集所有已完成的步骤
     current_step = None
+    current_step_index = -1
     completed_steps = []
     for idx, step in enumerate(current_plan.steps):
         if not step.execution_res:
             current_step = step
+            current_step_index = idx
             logger.debug(f"[_execute_agent_step] Found unexecuted step at index {idx}: {step.title}")
             break
-        else:
-            completed_steps.append(step)
+        completed_steps.append(step)
 
     if not current_step:
         logger.warning(f"[_execute_agent_step] No unexecuted step found in {len(current_plan.steps)} total steps")
         return Command(
-            update=preserve_state_meta_fields(state),
+            update={
+                **preserve_state_meta_fields(state),
+                "last_step_status": "failed",
+                "step_count": len(completed_steps),
+            },
             goto="research_team"
         )
 
@@ -788,7 +942,7 @@ async def _execute_agent_step(
                     f"# RESEARCH CONTEXT\n\n## Overall Goal\n{plan_title}\n\n"
                     f"{completed_steps_info}"
                     f"# CURRENT TASK (FOCUS HERE)\n\n"
-                    f"You are executing **Step {current_plan.steps.index(current_step) + 1}** of the plan.\n\n"
+                    f"You are executing **Step {current_step_index + 1}** of the plan.\n\n"
                     f"## Step Title\n{current_step.title}\n\n"
                     f"## Step Instructions\n{current_step.description}\n\n"
                     f"**MANDATORY INSTRUCTION**: Focus ONLY on executing this specific step. "
@@ -974,6 +1128,9 @@ async def _execute_agent_step(
                         )
                     ],
                     **preserve_state_meta_fields(state),
+                    "current_step_index": current_step_index,
+                    "last_step_status": "failed",
+                    "step_count": len(completed_steps),
                 },
                 goto="research_team",
             )
@@ -997,12 +1154,50 @@ async def _execute_agent_step(
     new_citations = extract_citations_from_messages(agent_messages)
     merged_citations = merge_citations(existing_citations, new_citations)
 
+    # Step quality gate (pass / replan)
+    should_replan, gate_reason = _evaluate_step_quality(
+        current_step,
+        response_content,
+        citations_count=len(new_citations),
+    )
+    diagnostics = list(state.get("step_diagnostics", []))
+    diagnostics.append({
+        "step_index": current_step_index,
+        "step_title": current_step.title,
+        "agent": agent_name,
+        "status": "replan" if should_replan else "pass",
+        "reason": gate_reason or "",
+    })
+
+    if should_replan:
+        # Clear current step result so planner can regenerate remaining steps from this point.
+        current_step.execution_res = None
+        return Command(
+            update={
+                **preserve_state_meta_fields(state),
+                "messages": agent_messages,
+                "citations": merged_citations,
+                "current_step_index": current_step_index,
+                "last_step_status": "replan",
+                "replan_reason": f"Step {current_step_index + 1} '{current_step.title}' failed quality gate: {gate_reason}",
+                "replan_count": state.get("replan_count", 0) + 1,
+                "step_diagnostics": diagnostics,
+                "step_count": len([s for s in current_plan.steps if s.execution_res]),
+            },
+            goto="planner",
+        )
+
     return Command(
         update={
             **preserve_state_meta_fields(state),
             "messages": agent_messages,
             # "observations": observations + [response_content + validation_info], # Removed observations
             "citations": merged_citations,
+            "current_step_index": current_step_index,
+            "last_step_status": "pass",
+            "replan_reason": "",
+            "step_diagnostics": diagnostics,
+            "step_count": len([s for s in current_plan.steps if s.execution_res]),
         },
         goto="research_team",
     )
@@ -1013,7 +1208,7 @@ async def _setup_and_execute_agent_step(
         config: RunnableConfig,
         agent_type: str,
         default_tools: list,
-) -> Command[Literal["research_team"]]:
+) -> Command[Literal["research_team", "planner"]]:
     """
     Helper function to set up an agent with appropriate tools and execute a step.
     
@@ -1078,7 +1273,7 @@ async def _setup_and_execute_agent_step(
 
 async def researcher_node(
         state: State, config: RunnableConfig
-) -> Command[Literal["research_team"]]:
+) -> Command[Literal["research_team", "planner"]]:
     """
     研究员节点 (Researcher Node)
 
@@ -1129,4 +1324,35 @@ async def researcher_node(
         config,
         "researcher",
         tools,
+    )
+
+
+async def analyst_node(
+        state: State, config: RunnableConfig
+) -> Command[Literal["research_team", "planner"]]:
+    """
+    Analyst node for analysis steps (no external tools by default).
+    """
+    logger.debug("Analyst node is analyzing.")
+    return await _setup_and_execute_agent_step(
+        state,
+        config,
+        "analyst",
+        [],
+    )
+
+
+async def coder_node(
+        state: State, config: RunnableConfig
+) -> Command[Literal["research_team", "planner"]]:
+    """
+    Coder node for processing steps.
+    Lightweight version without extra execution tools for now.
+    """
+    logger.debug("Coder node is processing.")
+    return await _setup_and_execute_agent_step(
+        state,
+        config,
+        "coder",
+        [],
     )

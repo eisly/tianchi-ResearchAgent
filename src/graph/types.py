@@ -35,3 +35,14 @@ class State(MessagesState):
     resources: list[Resource] = field(default_factory=list)
 
     citations: list[dict[str, Any]] = field(default_factory=list)
+
+    # Dynamic replanning and step quality gate state
+    current_step_index: int = -1
+    replan_count: int = 0
+    replan_reason: str = ""
+    last_step_status: str = ""  # pass | replan | failed
+    step_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+
+    # Iterative ReAct-style micro planning state
+    step_count: int = 0
+    react_max_steps: int = 3

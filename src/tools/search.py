@@ -36,10 +36,10 @@ _GOOGLE_SERPER_TOOL = None
 
 # Global search call counter
 _SEARCH_CALL_COUNTER = 0
-_MAX_SEARCH_CALLS = 10
+_MAX_SEARCH_CALLS = int(os.getenv("MAX_SEARCH_CALLS_PER_STEP", "20"))
 # Per-tool usage counter
 _TOOL_USAGE_COUNTER = {}
-_MAX_SINGLE_TOOL_CALLS = 5  # Maximum calls allowed for a single tool per step
+_MAX_SINGLE_TOOL_CALLS = int(os.getenv("MAX_SINGLE_TOOL_CALLS_PER_STEP", "10"))
 
 def reset_search_counter():
     """Reset the global search call counter and tool usage counters."""
