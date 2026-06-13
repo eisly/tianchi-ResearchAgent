@@ -38,6 +38,74 @@ from fastapi.responses import JSONResponse
 from agentscope_runtime.engine.schemas.agent_schemas import AgentRequest
 import uuid
 
+LOG_STREAM_QUEUES = {}
+
+
+def infer_log_stage(message: str, logger_name: str = "") -> str:
+    text = f"{logger_name} {message}".lower()
+    if "error" in text or "exception" in text or "failed" in text:
+        return "error"
+    if "planner" in text:
+        return "planner"
+    if "researcher" in text or "research_team" in text:
+        return "researcher"
+    if "search" in text or "crawl" in text or "wikidata" in text or "tool" in text:
+        return "search"
+    if "reporter" in text or "chatbot" in text or "[ai]" in text:
+        return "final"
+    return "system"
+
+
+def extract_log_markdown(message: str) -> str:
+    if not isinstance(message, str):
+        return str(message)
+
+    content = message.strip()
+    match = re.match(r"^\[[^\]]+\]\s*[:：]\s*(.*)$", content, re.DOTALL)
+    if match:
+        content = match.group(1).strip()
+
+    if (content.startswith("{") and content.endswith("}")) or (
+        content.startswith("[") and content.endswith("]")
+    ):
+        try:
+            parsed = json.loads(content)
+            content = "```json\n" + json.dumps(parsed, indent=2, ensure_ascii=False) + "\n```"
+        except json.JSONDecodeError:
+            pass
+
+    return content
+
+
+class QueueLogHandler(logging.Handler):
+    def __init__(self, queue, loop):
+        super().__init__()
+        self.queue = queue
+        self.loop = loop
+
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+            payload = {
+                "type": "log",
+                "level": record.levelname,
+                "logger": record.name,
+                "stage": infer_log_stage(message, record.name),
+                "message": message,
+                "markdown": extract_log_markdown(message),
+                "formatted": self.format(record),
+                "time": datetime.fromtimestamp(record.created).isoformat(timespec="seconds"),
+            }
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, payload)
+        except Exception:
+            self.handleError(record)
+
+
+def sse_event(event_name: str, payload=None) -> str:
+    if payload is None:
+        return f"event: {event_name}\n\n"
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
 # 覆盖默认的路由添加逻辑，支持自定义接口格式
 def patched_add_routes(
     app: FastAPI,
@@ -87,11 +155,13 @@ def patched_add_routes(
         async def event_generator():
             import asyncio
             q = asyncio.Queue()
+            loop = asyncio.get_running_loop()
             finished = False
             final_answer = ""
             
             # 立即发送一条初始 Ping
-            yield "event: Ping\n\n"
+            LOG_STREAM_QUEUES[session_id] = {"queue": q, "loop": loop}
+            yield sse_event("Ping")
             
             async def heartbeat():
                 while not finished:
@@ -129,7 +199,7 @@ def patched_add_routes(
                                 cleaned = clean_ai_response(msg.content)
                                 final_answer = cleaned
                     
-                    await q.put({"type": "result"})
+                    await q.put({"type": "result", "answer": final_answer})
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
@@ -144,26 +214,46 @@ def patched_add_routes(
                     item = await q.get()
                     
                     if item["type"] == "heartbeat":
-                        yield "event: Ping\n\n"
+                        yield sse_event("Ping")
+
+                    elif item["type"] == "log":
+                        yield sse_event("log", item)
                     
                     elif item["type"] == "result":
                         finished = True
-                        # Send the final answer
-                        yield f"event: Message\ndata: {json.dumps({'answer': final_answer}, ensure_ascii=False)}\n\n"
+                        # Keep the legacy Message event for existing Postman/tests,
+                        # and add explicit answer/done events for the web UI.
+                        payload = {"answer": item.get("answer", final_answer)}
+                        yield sse_event("answer", payload)
+                        yield sse_event("Message", payload)
+                        yield sse_event("done", {"ok": True})
                         break
                         
                     elif item["type"] == "error":
                         finished = True
                         error_msg = f"Error: {item['error']}"
-                        yield f"event: Message\ndata: {json.dumps({'answer': error_msg}, ensure_ascii=False)}\n\n"
+                        payload = {"answer": error_msg, "error": item["error"]}
+                        yield sse_event("error", payload)
+                        yield sse_event("Message", {"answer": error_msg})
+                        yield sse_event("done", {"ok": False})
                         break
             finally:
                 finished = True
                 t_heartbeat.cancel()
+                t_worker.cancel()
+                LOG_STREAM_QUEUES.pop(session_id, None)
 
         # 使用 text/event-stream 实现标准的 SSE 流式响应
         from fastapi.responses import StreamingResponse
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     # 根路径接口
     @app.get("/")
@@ -609,11 +699,23 @@ async def query_func(
     formatter = logging.Formatter('%(asctime)s - [%(name)s] - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
     request_logger.addHandler(file_handler)
+    stream_target = LOG_STREAM_QUEUES.get(session_id)
+    stream_handler = (
+        QueueLogHandler(stream_target["queue"], stream_target["loop"])
+        if stream_target
+        else None
+    )
+    if stream_handler:
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(formatter)
+        request_logger.addHandler(stream_handler)
     
     # Attach the file handler to the 'src' logger to capture logs from nodes.py and other modules
     src_logger = logging.getLogger("src")
     src_logger.setLevel(logging.INFO)
     src_logger.addHandler(file_handler)
+    if stream_handler:
+        src_logger.addHandler(stream_handler)
     
     request_logger.info(f"Starting new session: {session_id}")
     request_logger.info(f"User Input: {msgs[-1].content if msgs else 'None'}")
@@ -693,8 +795,10 @@ async def query_func(
         # Remove the handler from src logger to prevent duplicates/leaks
         if 'src_logger' in locals():
             src_logger.removeHandler(file_handler)
+            if stream_handler:
+                src_logger.removeHandler(stream_handler)
             
-        for handler in request_logger.handlers:
+        for handler in list(request_logger.handlers):
             handler.close()
             request_logger.removeHandler(handler)
 
